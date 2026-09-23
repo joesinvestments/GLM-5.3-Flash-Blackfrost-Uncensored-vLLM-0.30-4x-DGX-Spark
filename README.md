@@ -12,7 +12,7 @@ Measured 2026-09-22 against the launch-day-image build, same checkpoint and serv
 |---|---|---|
 | Prompt processing | 1,761 to 2,016 tok/s | **2,211 to 2,496 tok/s** (about 25% faster) |
 | Launch to serving | about 10 minutes | **about 4 minutes** (InstantTensor weight loading) |
-| Follow-up turn, time to first token | baseline | **about 12x faster** (0.30 prefix-caches the hybrid KDA model) |
+| Follow-up on a long prompt, time to first token | baseline | **about 12x faster** (0.30 prefix-caches the hybrid KDA model) |
 
 ## Results (2026-09-23, 12 production runs)
 
