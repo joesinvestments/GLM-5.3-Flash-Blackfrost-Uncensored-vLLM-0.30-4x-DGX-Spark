@@ -1,0 +1,23 @@
+diff --git a/vllm/platforms/cuda.py b/vllm/platforms/cuda.py
+index 30eed82..372e0c0 100644
+--- a/vllm/platforms/cuda.py
++++ b/vllm/platforms/cuda.py
+@@ -132,6 +132,7 @@ def _get_backend_priorities(
+         elif device_capability.major == 12:
+             return [
+                 AttentionBackendEnum.TRITON_MLA,
++                AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM90,
+                 AttentionBackendEnum.FLASHINFER_MLA_SPARSE_SM120,
+             ]
+         else:
+@@ -770,7 +771,9 @@ class CudaPlatformBase(Platform):
+             major, _ = torch.cuda.get_device_capability(device)
+         except Exception:
+             return False
+-        return major >= 9
++        # PDL lowering is unvalidated on SM12x (GB10) and races on KDA
++        # state kernels there; keep it to Hopper/Blackwell-datacenter.
++        return major in (9, 10)
+ 
+ 
+ # NVML utils

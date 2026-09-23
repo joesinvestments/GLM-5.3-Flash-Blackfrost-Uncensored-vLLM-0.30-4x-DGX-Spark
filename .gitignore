@@ -1,0 +1,6 @@
+# lab lane outputs and state (contain host names and IPs)
+tools/lab/results/
+tools/lab/.lab_run.history
+tools/lab/.lab.lock/
+__pycache__/
+*.pyc

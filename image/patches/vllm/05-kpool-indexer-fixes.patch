@@ -1,0 +1,43 @@
+diff --git a/vllm/model_executor/layers/sparse_attn_indexer_kpool.py b/vllm/model_executor/layers/sparse_attn_indexer_kpool.py
+index 2a31404..0be1f5f 100644
+--- a/vllm/model_executor/layers/sparse_attn_indexer_kpool.py
++++ b/vllm/model_executor/layers/sparse_attn_indexer_kpool.py
+@@ -535,8 +535,11 @@ def sparse_attn_indexer_kpool(
+             # expand each pool back to its kpool constituent tokens.
+             select_k = topk_tokens // index_kpool if index_kpool > 1 else topk_tokens
+             if index_kpool > 1:
+-                pool_topk = torch.empty(
+-                    (num_rows, select_k), dtype=torch.int32, device=logits.device
++                pool_topk = torch.full(
++                    (num_rows, select_k),
++                    -1,
++                    dtype=torch.int32,
++                    device=logits.device,
+                 )
+                 topk_dst = pool_topk
+             else:
+@@ -798,14 +801,21 @@ def sparse_attn_indexer_kpool(
+         # then expand each pool back to its kpool tokens.
+         select_k = topk_tokens // index_kpool if index_kpool > 1 else topk_tokens
+         if index_kpool > 1:
+-            pool_topk = torch.empty(
+-                (num_rows, select_k), dtype=torch.int32, device=logits.device
++            pool_topk = torch.full(
++                (num_rows, select_k), -1, dtype=torch.int32, device=logits.device
+             )
+             topk_dst = pool_topk
+         else:
+             topk_dst = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
+ 
+-        if current_platform.is_cuda() and select_k in (512, 1024, 2048):
++        # SM121/GB10 (48 SMs, 99KB smem): persistent_topk oversubscribes past
++        # ~24K ctx and its FilteredTopK fallback needs 128KB smem -> hard raise.
++        # Route small-SM parts to top_k_per_row_decode instead.
++        if (
++            current_platform.is_cuda()
++            and select_k in (512, 1024, 2048)
++            and torch.cuda.get_device_properties(0).multi_processor_count >= 78
++        ):
+             workspace_manager = current_workspace_manager()
+             (topk_workspace,) = workspace_manager.get_simultaneous(
+                 ((RADIX_TOPK_WORKSPACE_SIZE,), torch.uint8),

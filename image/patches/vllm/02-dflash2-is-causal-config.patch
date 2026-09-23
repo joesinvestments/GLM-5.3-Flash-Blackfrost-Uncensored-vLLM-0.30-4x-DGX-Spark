@@ -1,0 +1,16 @@
+diff --git a/vllm/model_executor/models/qwen3_dflash.py b/vllm/model_executor/models/qwen3_dflash.py
+index 5504304..3ef01c0 100644
+--- a/vllm/model_executor/models/qwen3_dflash.py
++++ b/vllm/model_executor/models/qwen3_dflash.py
+@@ -59,6 +59,11 @@ _SLIDING_ATTENTION = "sliding_attention"
+ def _dflash_layer_causal(config: Qwen3Config, layer_idx: int) -> bool:
+     """Resolve explicit causality before falling back to legacy layer defaults."""
+     is_causal = getattr(config, "is_causal", None)
++    if is_causal is None:
++        # The GLM-5.3-Flash DFlash2 drafter ships its causality inside
++        # dflash_config rather than at the top level.
++        dflash_cfg = getattr(config, "dflash_config", None) or {}
++        is_causal = dflash_cfg.get("is_causal")
+     if is_causal is not None:
+         return bool(is_causal)
+     override = (getattr(config, "dflash_config", None) or {}).get("causal")
