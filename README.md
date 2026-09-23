@@ -41,7 +41,7 @@ Measured 2026-09-22 against the launch-day-image build, same checkpoint and serv
 | 4 | 69 tok/s | 65 to 71 |
 | 8 | 83 tok/s | 77 to 91 |
 
-These sit well below the one-shot numbers: agent turns are short (100 to 160 tokens on average), default sampling accepts fewer drafted tokens (0.30 to 0.34 against 0.39 at temperature 0), and prompts shorter than 2,304 tokens are processed in full on every turn (see `docs/findings.md`).
+These sit well below the one-shot numbers: agent turns are short (100 to 160 tokens on average), default sampling accepts fewer drafted tokens (0.30 to 0.34 against 0.39 at temperature 0), and every turn's prompt is processed in full, because agent turns get no prefix-cache hits on this model (see `docs/findings.md`).
 
 ## What's here
 
@@ -89,6 +89,7 @@ Details and numbers are in [docs/findings.md](docs/findings.md).
 - **Where decode time goes.** At 1 user: MoE experts 45%, BF16 GEMMs 19%, NCCL 13%, GPU idle 6%. At 32 users: MoE 47%, the KDA linear-attention kernel 19%, NCCL 12%, idle 1%. The MoE is at the memory-bandwidth limit.
 - **Component speedups did not carry into serving.** A graph-capturable RoCE all-reduce 2 to 4x faster than NCCL, and a 2x faster KDA kernel from bf16 state, each moved end-to-end throughput by only about 2%. Judge changes by a serving A/B.
 - **No public drafter beats the one we run.** incoai's newer revisions win some prompts and lose others (dc77ff1: 3.6% faster at 8 users on a code prompt, 5% slower on single-user JSON), and across 1 to 8 concurrent agent sessions dc77ff1 came out 3% behind. The modal-labs DFlash drafter ties. Against stock RedHatAI NVFP4, our converted checkpoint (DERISKED weights, NVFP4 attention) gives up almost nothing in acceptance, and stock is 10 to 25% slower for one user (45% on a long prompt), about even at 32 users.
+- **Agent turns never hit the prefix cache.** Zero hits on about 440K prompt tokens of agent traffic with 2,304-token blocks, and again with 1,280-token blocks. A new turn needs the KDA state from the end of the previous request, which vLLM does not save; that is the upstream fix.
 - **A vLLM bug:** `--mamba-ssm-cache-dtype` is silently ignored for GLM-5.3-Flash. Fix in `image/patches/vllm/optional/09-*.patch`.
 - **A network trap on Spark clusters:** a netplan `match: {}` let NetworkManager bring the rail address up on the wrong QSFP function after a network blip, while `/health` stayed green.
 
