@@ -94,7 +94,7 @@ Details and numbers are in [docs/findings.md](docs/findings.md).
 
 ## Credits
 
-- **Tony ([tonyd2wild](https://github.com/tonyd2wild))**: the GB10 patch set and image that patches 01 to 08 are ported from, the two FlashInfer FP8 MLA fixes, and the NVFP4-attention conversion recipe.
+- **Tony ([@2WildTech](https://x.com/2WildTech), [tonyd2wild](https://github.com/tonyd2wild))**: the GB10 patch set and image that patches 01 to 08 are ported from, the two FlashInfer FP8 MLA fixes, and the NVFP4-attention conversion recipe.
 - **[Blackfrost](https://huggingface.co/Blackfrost-AI)**: GLM-5.3-Flash-DERISKED-NVFP4 (MIT). The checkpoint served here adds NVFP4 attention on top of their weights; per their model card, Blackfrost has not evaluated modified versions. **[Z.ai](https://huggingface.co/zai-org)**: GLM-5.3-Flash (MIT).
 - **[incoai](https://huggingface.co/incoai)**: the GLM-5.3-Flash DFlash2 drafter (CC BY-NC-ND 4.0).
 - **[vLLM](https://github.com/vllm-project/vllm)** and **[FlashInfer](https://github.com/flashinfer-ai/flashinfer)** (Apache-2.0).
