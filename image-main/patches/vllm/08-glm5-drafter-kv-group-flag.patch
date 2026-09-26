@@ -1,0 +1,288 @@
+--- a/vllm/v1/core/kv_cache_utils.py
++++ b/vllm/v1/core/kv_cache_utils.py
+@@ -1210,10 +1210,21 @@
+         for name, spec in kv_cache_spec.items()
+         if isinstance(spec, KpoolTailSpec)
+     }
++    # DFLASH2-DRAFTER-GROUP: a spec-decode drafter (DFlash2) adds plain
++    # SlidingWindowSpec layers on top of the GLM-5-Next hybrid. Partition them
++    # out (exact type: KpoolTailSpec subclasses SlidingWindowSpec) so they do
++    # not disqualify the model from this fast path; they are appended as one
++    # extra group below.
++    draft_specs = {
++        name: spec
++        for name, spec in kv_cache_spec.items()
++        if type(spec) is SlidingWindowSpec
++    }
+     attn_specs = {
+         name: spec
+         for name, spec in kv_cache_spec.items()
+         if not isinstance(spec, (MambaSpec, KpoolTailSpec))
++        and type(spec) is not SlidingWindowSpec
+     }
+     if not mamba_specs or not all(
+         type(spec) is MLAAttentionSpec for spec in attn_specs.values()
+@@ -1270,10 +1281,76 @@
+     for index, name in enumerate(mamba_specs):
+         mamba_grouped_names[index % num_groups].append(name)
+ 
++    # Drafter group (DFLASH2-DRAFTER-GROUP): one extra group for the spec-
++    # decode drafter's SlidingWindowSpec layers, appended LAST so existing
++    # group ids stay stable. NEVER page_size_padded: a padded spec routes the
++    # runner into the strided-view reshape, which is invalid when the backend
++    # virtually splits the manager block into smaller kernel blocks. Both
++    # modes below use the ordinary contiguous reshape, valid under any split.
++    draft_group: KVCacheGroupSpec | None = None
++    if draft_specs:
++        any_draft = next(iter(draft_specs.values()))
++        assert all(spec == any_draft for spec in draft_specs.values()), (
++            "drafter SlidingWindowSpec layers must share one spec"
++        )
++        draft_bytes_per_token = any_draft.page_size_bytes // any_draft.block_size
++        mla_block = mla_specs[mla_names[0]].block_size
++        fit_block = (
++            mla_page // draft_bytes_per_token
++            if mla_page % draft_bytes_per_token == 0
++            else 0
++        )
++        if (
++            fit_block
++            # A 64-divisible manager block is divisible by every int kernel
++            # block size the SWA backends register (16/32/64), so a clean
++            # split always exists.
++            and fit_block % 64 == 0
++            # Keep the scheduler block-size LCM bounded by max(mla, fit).
++            and (fit_block % mla_block == 0 or mla_block % fit_block == 0)
++            and len(draft_specs) <= len(mla_names)
++        ):
++            # EXACT FIT: the drafter's real page equals the MLA page, so
++            # drafter layer i co-owns MLA tensor i at disjoint block ids
++            # (like mamba) with a contiguous view: kernel block j of manager
++            # block b lands at b * mla_page + j * kernel_page, inside block
++            # b's own page. Per-block pool cost unchanged.
++            new_draft_specs: dict[str, KVCacheSpec] = {
++                name: replace(spec, block_size=fit_block)
++                for name, spec in draft_specs.items()
++            }
++        else:
++            # STANDALONE: the drafter's geometry cannot exactly fill the MLA
++            # page; keep its spec as-is and give its layers compact tensors
++            # of their own (emitted in get_kv_cache_config_from_groups and
++            # charged in the per-block cost).
++            new_draft_specs = dict(draft_specs)
++        draft_uniform = UniformTypeKVCacheSpecs.from_specs(new_draft_specs)
++        assert draft_uniform is not None
++        # DFLASH2-DRAFTER-GROUP: the drafter group is the only group that
++        # holds the DFlash2 drafter's attention layers, so it is the only one
++        # that must take the EAGLE last-block drop (the coordinator's
++        # conservative "flag all groups" fallback would over-drop the MLA and
++        # mamba groups). get_kv_cache_groups returns GLM-5-Next groups before
++        # _annotate_eagle_groups runs and neither annotation rule there
++        # matches a sliding-window drafter, so flag it here, behind the same
++        # gate as _annotate_eagle_groups: with disable_eagle_block_drop no
++        # group may be flagged, or get_replay_boundaries moves every Mamba
++        # retention boundary one block below the checkpoint the scheduler
++        # writes and resumed prompts lose their recurrent state.
++        spec_config = getattr(vllm_config, "speculative_config", None)
++        draft_group = KVCacheGroupSpec(
++            list(new_draft_specs),
++            draft_uniform,
++            is_eagle_group=spec_config is not None
++            and spec_config.use_eagle_block_drop(),
++        )
++
+     return (
+         [KVCacheGroupSpec(list(attn_specs), uniform_spec)]
+         + ([tail_group] if tail_group is not None else [])
+         + create_kv_cache_group_specs(padded_specs, mamba_grouped_names)
++        + ([draft_group] if draft_group is not None else [])
+     )
+ 
+ 
+@@ -1289,6 +1366,7 @@
+         int,
+         list[str],
+         int,
++        KVCacheGroupSpec | None,
+     ]
+     | None
+ ):
+@@ -1303,12 +1381,19 @@
+     ]
+     attn_group: KVCacheGroupSpec | None = None
+     tail_group: KVCacheGroupSpec | None = None
++    draft_group: KVCacheGroupSpec | None = None
+     for group in uniform_groups:
+         inner = cast(UniformTypeKVCacheSpecs, group.kv_cache_spec).kv_cache_specs
+         if all(type(spec) is MLAAttentionSpec for spec in inner.values()):
+             attn_group = group
+         elif all(isinstance(spec, KpoolTailSpec) for spec in inner.values()):
+             tail_group = group
++        elif inner and all(
++            type(spec) is SlidingWindowSpec for spec in inner.values()
++        ):
++            # DFLASH2-DRAFTER-GROUP: the spec-decode drafter's SWA group
++            # (validated below once mla_page is known).
++            draft_group = group
+     if attn_group is None or not mamba_groups:
+         return None
+     if len(uniform_groups) + len(mamba_groups) != len(kv_cache_groups):
+@@ -1335,6 +1420,25 @@
+     idx_page = idx_pages.pop()
+     if any(group.kv_cache_spec.page_size_bytes != mla_page for group in mamba_groups):
+         return None
++    if draft_group is not None:
++        # DFLASH2-DRAFTER-GROUP: one uniform page across drafter layers and
++        # NEVER page_size_padded (a padded drafter view is invalid under
++        # kernel block splitting). page == mla_page means exact-fit
++        # slot-sharing of the MLA tensors (needs one tensor per drafter
++        # layer); any other page means standalone drafter tensors.
++        draft_inner = cast(
++            UniformTypeKVCacheSpecs, draft_group.kv_cache_spec
++        ).kv_cache_specs
++        draft_pages = {spec.page_size_bytes for spec in draft_inner.values()}
++        if len(draft_pages) != 1:
++            return None
++        if any(spec.page_size_padded is not None for spec in draft_inner.values()):
++            return None
++        if (
++            draft_pages.pop() == mla_page
++            and len(draft_group.layer_names) > len(mla_names)
++        ):
++            return None
+ 
+     tail_names: list[str] = []
+     tail_page = 0
+@@ -1362,6 +1466,7 @@
+         idx_page,
+         tail_names,
+         tail_page,
++        draft_group,
+     )
+ 
+ 
+@@ -1593,8 +1698,24 @@
+ ) -> int:
+     """Return the largest cache group's bytes per block."""
+     if (glm5_layout := _glm5_next_tensor_layout(kv_cache_groups)) is not None:
+-        _, _, mla_names, idx_names, mla_page, idx_page, _, _ = glm5_layout
+-        return len(mla_names) * mla_page + len(idx_names) * idx_page
++        _, _, mla_names, idx_names, mla_page, idx_page, _, _, draft_group = (
++            glm5_layout
++        )
++        per_block = len(mla_names) * mla_page + len(idx_names) * idx_page
++        if draft_group is not None:
++            # DFLASH2-DRAFTER-GROUP: an exact-fit drafter (page == mla_page)
++            # slot-shares the MLA tensors and adds no bytes; a standalone
++            # drafter adds one page per drafter layer.
++            draft_page = next(
++                iter(
++                    cast(
++                        UniformTypeKVCacheSpecs, draft_group.kv_cache_spec
++                    ).kv_cache_specs.values()
++                )
++            ).page_size_bytes
++            if draft_page != mla_page:
++                per_block += len(draft_group.layer_names) * draft_page
++        return per_block
+ 
+     bytes_per_block = max(
+         sum(
+@@ -1701,8 +1822,26 @@
+             idx_page,
+             tail_names,
+             _,
++            draft_group,
+         ) = glm5_layout
+         bytes_per_block = len(mla_names) * mla_page + len(idx_names) * idx_page
++        draft_names: list[str] = []
++        draft_page = 0
++        draft_shared = False
++        if draft_group is not None:
++            draft_names = list(draft_group.layer_names)
++            draft_page = next(
++                iter(
++                    cast(
++                        UniformTypeKVCacheSpecs, draft_group.kv_cache_spec
++                    ).kv_cache_specs.values()
++                )
++            ).page_size_bytes
++            # Exact fit: the drafter's real page equals the MLA page, so it
++            # rides the MLA tensors; otherwise it gets standalone tensors.
++            draft_shared = draft_page == mla_page
++            if not draft_shared:
++                bytes_per_block += len(draft_names) * draft_page
+         num_blocks = may_override_num_blocks(
+             vllm_config, available_memory // bytes_per_block
+         )
+@@ -1730,6 +1869,18 @@
+             for group in mamba_groups:
+                 if index < len(group.layer_names):
+                     add_tensor(group.layer_names[index], group.kv_cache_spec, offset)
++            # DFLASH2-DRAFTER-GROUP (exact fit): drafter layer i rides MLA
++            # tensor i (contiguous view, disjoint block ids), like mamba.
++            if draft_shared and index < len(draft_names):
++                # Per-layer spec: the group's UniformTypeKVCacheSpecs sums every drafter
++                # layer's page, which would give this view an N-page block stride.
++                add_tensor(
++                    draft_names[index],
++                    cast(
++                        UniformTypeKVCacheSpecs, draft_group.kv_cache_spec
++                    ).kv_cache_specs[draft_names[index]],
++                    offset,
++                )
+ 
+         idx_base = len(mla_names) * mla_page * num_blocks
+         for index, idx_name in enumerate(idx_names):
+@@ -1745,6 +1896,19 @@
+                 ).kv_cache_specs
+                 add_tensor(tail_name, tail_specs[tail_name], offset)
+ 
++        if draft_names and not draft_shared:
++            # DFLASH2-DRAFTER-GROUP (standalone): compact per-layer drafter
++            # tensors; contiguous reshape, safe under kernel block splitting.
++            draft_specs = cast(
++                UniformTypeKVCacheSpecs, draft_group.kv_cache_spec
++            ).kv_cache_specs
++            draft_base = (
++                len(mla_names) * mla_page + len(idx_names) * idx_page
++            ) * num_blocks
++            for index, draft_name in enumerate(draft_names):
++                offset = draft_base + index * draft_page * num_blocks
++                add_tensor(draft_name, draft_specs[draft_name], offset)
++
+         return KVCacheConfig(
+             num_blocks=num_blocks,
+             kv_cache_tensors=kv_cache_tensors,
+@@ -2468,6 +2632,7 @@
+             idx_page,
+             tail_names,
+             _,
++            draft_group,
+         ) = glm5_layout
+         uniform_spec = cast(UniformTypeKVCacheSpecs, attn_group.kv_cache_spec)
+         total_blocks = uniform_spec.max_memory_usage_pages(vllm_config)
+@@ -2480,7 +2645,22 @@
+         )
+         if tail_names:
+             total_blocks += 1
+-        return total_blocks * (len(mla_names) * mla_page + len(idx_names) * idx_page)
++        per_block = len(mla_names) * mla_page + len(idx_names) * idx_page
++        if draft_group is not None:
++            # DFLASH2-DRAFTER-GROUP: charge the drafter's window-bounded
++            # block-id demand; a standalone drafter also adds its pages to
++            # every block's byte cost (an exact-fit one rides the MLA
++            # tensors and adds none).
++            draft_uniform = cast(
++                UniformTypeKVCacheSpecs, draft_group.kv_cache_spec
++            )
++            total_blocks += draft_uniform.max_memory_usage_pages(vllm_config)
++            draft_page = next(
++                iter(draft_uniform.kv_cache_specs.values())
++            ).page_size_bytes
++            if draft_page != mla_page:
++                per_block += len(draft_group.layer_names) * draft_page
++        return total_blocks * per_block
+ 
+     bytes_per_block = _pool_bytes_per_block(kv_cache_groups)
+     total_blocks = 0

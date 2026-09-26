@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
-# Launch one rank of GLM-5.3-Flash across 4 DGX Sparks (TP=4, one GPU per node) with the image from ../image-main/build.sh
-# (vLLM main 7f1a + our patches). For the v0.30 release build use launch_node_v030.sh.
+# Launch one rank of GLM-5.3-Flash across 4 DGX Sparks (TP=4, one GPU per node) with the v0.30 release image from ../image/build.sh.
 # These are the exact serving flags behind the published numbers; only machine-specific values are variables.
 # Run on every node, workers first (3, 2, 1) and the head (0) last:   NODES="10.0.0.1 10.0.0.2 10.0.0.3 10.0.0.4" ./launch_node.sh <rank>
 set -uo pipefail
 NODE_RANK="${1:?usage: NODES=\"ip0 ip1 ip2 ip3\" launch_node.sh <0|1|2|3>}"
 read -r -a NODES <<< "${NODES:?set NODES to the 4 rail IPs, rank 0 first}"
 [ ${#NODES[@]} = 4 ] || { echo "NODES must list 4 IPs"; exit 2; }
-IMAGE=${IMAGE:-glm53-flash-gb10:main-7f1a}
+IMAGE=${IMAGE:-glm53-flash-gb10:v0.30.0}
 HF_ROOT=${HF_ROOT:-/var/tmp/hf}                       # host dir mounted at /cache/huggingface
 MODEL=${MODEL:-glm53-flash-derisked-mse}             # dir under $HF_ROOT/hub (see README: checkpoint)
 DRAFTER=${DRAFTER:-glm53-flash-dflash2}               # dir under $HF_ROOT/hub (incoai/GLM-5.3-Flash-DFlash2)
@@ -17,7 +16,7 @@ RAIL_HCAS=${RAIL_HCAS:-rocep1s0f0,roceP2p1s0f0}
 GLOO_IF=${GLOO_IF:-enp1s0f0np0}
 GID_INDEX=${GID_INDEX:-3}                             # check /sys/class/infiniband/*/ports/1/gids/3 after any network event
 NAME=${NAME:-glm53_vllm}; PORT=${PORT:-8000}; MPORT=${MPORT:-29654}
-GMU=0.85; MAXLEN=500000; SEQS=64; MNBT=8192; BLOCK=2304; MOE_BACKEND=humming; SPEC_K=7
+GMU=0.85; MAXLEN=500000; SEQS=64; MNBT=8192; BLOCK=2304; MOE_BACKEND=marlin; SPEC_K=7
 KV_MEM=38654705664; KV_DTYPE=fp8_e4m3; CG=FULL_AND_PIECEWISE   # 36 GiB KV: 38 left the head node too close to a 4% earlyoom line
 # Speculative decoding: block verification, draft length by batch size (7 tokens at 1 request, 5 at 2-3, 4 at 4+), and
 # disable_eagle_block_drop, which keeps the last cached block when an agent session resumes (see docs/findings.md).
@@ -28,7 +27,7 @@ HEADLESS=""; [ "$NODE_RANK" != 0 ] && HEADLESS="--headless"
 for f in "$HF_ROOT/hub/$MODEL/config.json" "$HF_ROOT/hub/$MODEL/chat_template_zai0907_optout.jinja" "$HF_ROOT/hub/$DRAFTER/config.json"; do
   test -f "$f" || { echo "MISSING $f"; exit 3; }
 done
-docker image inspect "$IMAGE" >/dev/null 2>&1 || { echo "MISSING image $IMAGE (build it with ../image-main/build.sh)"; exit 3; }
+docker image inspect "$IMAGE" >/dev/null 2>&1 || { echo "MISSING image $IMAGE (build it with ../image/build.sh)"; exit 3; }
 mkdir -p "$CACHE"
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 

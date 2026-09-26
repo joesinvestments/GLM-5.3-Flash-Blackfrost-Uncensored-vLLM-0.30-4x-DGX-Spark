@@ -1,0 +1,11 @@
+--- a/flashinfer/mla/_core.py
++++ b/flashinfer/mla/_core.py
+@@ -2199,7 +2199,7 @@
+                     f"backend on SM90, got backend={self._backend!r}."
+                 )
+             major, minor = get_compute_capability(self.device)
+-            if major != 9:
++            if major not in (9, 12):
+                 raise ValueError(
+                     "FP8 kv_data_type for MLA requires an SM90 (Hopper) device, "
+                     f"got SM{major}{minor}."

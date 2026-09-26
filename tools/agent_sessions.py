@@ -1,7 +1,7 @@
 # Agent-session load at 1, 2, 4 and 8 concurrent sessions: what coding agents actually send, not one-shot prompts.
 # Each session runs agent tasks as 3-turn tool loops: system prompt + 6 tools, the model's turn, a canned tool result,
 # the next turn. Half the sessions think (enable_thinking true, as coding agents with thinking on send), half do not
-# (the server default in launch_node.sh is thinking off). No temperature is sent, so requests get the model's default
+# (they send enable_thinking false; the server default in launch_node.sh is thinking on). No temperature is sent, so requests get the model's default
 # sampling (1.0 / top_p 0.95), like clients that do not set it. Per level: aggregate completion tok/s over the level's
 # wall time, and acceptance from the server's spec-decode counters (foreign traffic is counted, not hidden).
 # Usage: ENDPOINT=http://head:8000 python3 agent_sessions.py <label> <out.json> [sweeps, default 3]

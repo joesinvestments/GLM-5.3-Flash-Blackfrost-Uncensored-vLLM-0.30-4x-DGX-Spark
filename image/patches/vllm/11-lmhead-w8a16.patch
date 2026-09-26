@@ -1,0 +1,68 @@
+--- a/vllm/models/glm5next/nvidia/model.py	2026-09-24 09:07:40
++++ b/vllm/models/glm5next/nvidia/model.py	2026-09-24 09:08:40
+@@ -1055,9 +1055,15 @@
+ 
+     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+         loader = AutoWeightsLoader(self)
+-        return loader.load_weights(weights)
++        loaded = loader.load_weights(weights)
++        # Optional 8-bit lm_head (patch 11), shared with the DFlash2 drafter. Off unless VLLM_LMHEAD_W8A16=1.
++        if isinstance(self.lm_head, ParallelLMHead):
++            from vllm.model_executor.models.lmhead_w8a16 import finalize_lm_head_w8a16
+ 
++            finalize_lm_head_w8a16(self.lm_head)
++        return loaded
+ 
++
+ @MULTIMODAL_REGISTRY.register_processor(
+     Glm5NextMultiModalProcessor,
+     info=Glm5NextProcessingInfo,
+--- a/vllm/model_executor/models/lmhead_w8a16.py	2026-09-24 17:26:51
++++ b/vllm/model_executor/models/lmhead_w8a16.py	2026-09-24 09:08:34
+@@ -0,0 +1,46 @@
++# SPDX-License-Identifier: Apache-2.0
++"""8-bit lm_head (INT8 symmetric, group 128, native Marlin W8A16) for GLM-5.3-Flash.
++
++The checkpoint keeps lm_head in BF16 (ModelOpt ignore list), [vocab / TP, hidden] = [38720, 4096] per rank at TP4.
++It runs twice per decode step: the target's verify logits and the DFlash2 drafter's candidate logits (the drafter
++shares the target's module), 2.76 ms of the 58.9 ms step at 1 user (2026-09-23 trace). After the target's loader,
++this swaps the module's method for patch 10's Marlin W8A16 path (pack_projection), halving the weight bytes read per
++call. Off unless VLLM_LMHEAD_W8A16=1.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++
++import torch
++from torch import nn
++
++from vllm.logger import init_logger
++from vllm.model_executor.layers.linear import UnquantizedLinearMethod
++from vllm.model_executor.layers.vocab_parallel_embedding import UnquantizedEmbeddingMethod
++from vllm.model_executor.models.drafter_w8a16 import pack_projection
++
++logger = init_logger(__name__)
++
++ENABLE_ENV = "VLLM_LMHEAD_W8A16"
++
++
++@torch.no_grad()
++def finalize_lm_head_w8a16(lm_head: nn.Module, environ: dict | None = None) -> None:
++    """Convert the target's BF16 lm_head after its loader, if enabled. Refuses anything but a plain BF16 CUDA head."""
++    raw = (os.environ if environ is None else environ).get(ENABLE_ENV, "0").strip()
++    if raw not in ("", "0", "1"):
++        raise RuntimeError(f"{ENABLE_ENV} must be 0 or 1, got {raw!r}")
++    if raw != "1" or getattr(lm_head, "_w8a16_ready", False):
++        return
++    w = getattr(lm_head, "weight", None)
++    if (w is None or w.dim() != 2 or w.dtype != torch.bfloat16 or w.device.type != "cuda"
++            or not isinstance(getattr(lm_head, "quant_method", None), (UnquantizedEmbeddingMethod, UnquantizedLinearMethod))
++            or getattr(lm_head, "bias", None) is not None):
++        raise RuntimeError(f"lm_head W8A16 needs the plain BF16 CUDA lm_head, got {type(lm_head).__name__}")
++    size_n, size_k = w.shape
++    receipt = pack_projection(lm_head, size_n, size_k)
++    lm_head._w8a16_ready = True
++    torch.cuda.empty_cache()
++    logger.info("LM_HEAD_W8A16_READY %s", json.dumps({"n": size_n, "k": size_k, **receipt}, sort_keys=True))

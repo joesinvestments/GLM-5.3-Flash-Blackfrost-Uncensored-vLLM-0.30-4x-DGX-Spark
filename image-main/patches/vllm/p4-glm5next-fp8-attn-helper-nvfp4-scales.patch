@@ -1,0 +1,19 @@
+diff --git a/vllm/models/glm5next/common/model.py b/vllm/models/glm5next/common/model.py
+index 77deb73..7570278 100644
+--- a/vllm/models/glm5next/common/model.py
++++ b/vllm/models/glm5next/common/model.py
+@@ -1334,9 +1334,13 @@ def _try_load_fp8_attn_proj(
+     target_w = f"{layer_prefix}.{target_base}.weight"
+     target_s = f"{layer_prefix}.{target_base}.weight_scale_inv"
+     # If the model actually kept this projection in FP8, let the normal path
+-    # handle it (it has a weight_scale_inv param).
++    # handle it (it has a weight_scale_inv param), or it keeps its own
++    # quantization scale (e.g. MODELOPT NVFP4 names its attention scales
++    # ``weight_scale``): the buffered block-FP8 path must not swallow them.
+     if target_s in params_dict:
+         return False
++    if f"{layer_prefix}.{target_base}.weight_scale" in params_dict:
++        return False
+ 
+     entry = buf.setdefault(layer_prefix, {}).setdefault(key, {})
+     entry["weight" if is_weight else "scale"] = tensor

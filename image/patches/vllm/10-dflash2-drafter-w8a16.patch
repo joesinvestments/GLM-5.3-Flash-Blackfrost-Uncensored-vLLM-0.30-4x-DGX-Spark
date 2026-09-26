@@ -1,0 +1,209 @@
+diff -ruN a/vllm/model_executor/models/drafter_w8a16.py b/vllm/model_executor/models/drafter_w8a16.py
+--- a/vllm/model_executor/models/drafter_w8a16.py	1969-12-31 19:00:00
++++ b/vllm/model_executor/models/drafter_w8a16.py	2026-09-23 20:49:15
+@@ -0,0 +1,185 @@
++# SPDX-License-Identifier: Apache-2.0
++"""8-bit weights (INT8 symmetric, group 128, native Marlin W8A16) for the DFlash2 drafter.
++
++Port to stock vLLM v0.30.0 of jnardiello's E22b
++(github.com/jnardiello/GLM-5.3-Flash-FP8-4-DGX-Spark-Switchless,
++scripts/node/experiments/e03/drafter-w8a16, Apache-2.0 SPDX headers), itself built on the
++JSpark3 trunk_w8a16 post-load pattern (Apache-2.0). Measured there on FP8 GLM-5.3-Flash:
++code decode +3.03%, single-user +2.23%, prose +2.97%.
++
++After the vendor loader, each drafter decoder layer converts self_attn.qkv_proj,
++self_attn.o_proj, mlp.gate_up_proj, mlp.down_proj and both grouped convolutions'
++kernel_projection (30 modules for 5 layers). These see only the query rows of each draft
++step, a few dozen at most, so they always run Marlin and need no BF16 scratch. Not
++converted: the fused context K/V projection (it sees every context row; converting it
++cost about 3% of cold prefill in his measurement), fc, lm_head, embed_tokens and the
++candidate selector. Every expected shape is derived from the drafter config and the TP
++size; any mismatch refuses before a weight changes.
++
++Differences from the original, for vLLM v0.30.0's Marlin helpers: gptq_quantize_weights
++returns three values and takes no act_order; gptq_marlin_repack takes no permutation;
++apply_gptq_marlin_linear takes no g_idx/is_k_full and pads the input itself. Off unless
++VLLM_DRAFTER_W8A16=1.
++"""
++
++from __future__ import annotations
++
++import json
++import os
++
++import torch
++from torch import nn
++
++from vllm import _custom_ops as ops
++from vllm.logger import init_logger
++from vllm.model_executor.layers.linear import LinearMethodBase, UnquantizedLinearMethod
++from vllm.model_executor.layers.quantization.utils.marlin_utils import (
++    apply_gptq_marlin_linear,
++    marlin_make_workspace_new,
++    marlin_pad_qweight,
++    marlin_pad_scales,
++    marlin_padded_nk,
++    marlin_permute_scales,
++)
++from vllm.model_executor.layers.quantization.utils.quant_utils import (
++    gptq_quantize_weights,
++    pack_quantized_values_into_int32,
++)
++from vllm.scalar_type import scalar_types
++
++logger = init_logger(__name__)
++
++ENABLE_ENV = "VLLM_DRAFTER_W8A16"
++GROUP_SIZE = 128
++WTYPE = scalar_types.uint8b128
++EXPECTED_LAYERS = 5
++
++
++def enabled(environ: dict | None = None) -> bool:
++    raw = (os.environ if environ is None else environ).get(ENABLE_ENV, "0").strip()
++    try:
++        return int(raw or "0") != 0
++    except ValueError:
++        raise RuntimeError(f"{ENABLE_ENV} must be an integer, got {raw!r}") from None
++
++
++class DrafterW8A16Method(LinearMethodBase):
++    """Marlin W8A16 apply path installed on an already-loaded BF16 linear."""
++
++    def __init__(self, size_n: int, size_k: int):
++        self.size_n = size_n
++        self.size_k = size_k
++
++    def create_weights(self, layer: nn.Module, *args, **kwargs) -> None:
++        raise RuntimeError("drafter W8A16 attaches after the BF16 loader finishes")
++
++    def apply(self, layer: nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
++        return apply_gptq_marlin_linear(
++            input=x,
++            weight=layer.w8_qweight,
++            weight_scale=layer.w8_scales,
++            weight_zp=layer.w8_empty,
++            workspace=layer.w8_workspace,
++            wtype=WTYPE,
++            output_size_per_partition=self.size_n,
++            input_size_per_partition=self.size_k,
++            bias=bias,
++            use_fp32_reduce=True,
++        )
++
++
++@torch.no_grad()
++def pack_projection(module: nn.Module, size_n: int, size_k: int) -> dict:
++    """Quantize module.weight [N, K] (BF16) to INT8 g128, repack for Marlin, swap the method."""
++    weight = module.weight
++    _, quantized, scales = gptq_quantize_weights(weight.T.contiguous(), WTYPE, GROUP_SIZE)
++    packed = pack_quantized_values_into_int32(quantized, WTYPE, packed_dim=0).contiguous()
++    del quantized
++    padded_n, padded_k = marlin_padded_nk(size_n, size_k, GROUP_SIZE)
++    if padded_k != size_k:
++        raise RuntimeError(f"drafter W8A16 needs an unpadded K; Marlin padded {size_k} to {padded_k}")
++    packed = marlin_pad_qweight(packed, size_n, size_k, padded_n, padded_k)
++    repacked = ops.gptq_marlin_repack(packed, padded_k, padded_n, WTYPE.size_bits)
++    del packed
++    scales = marlin_permute_scales(
++        marlin_pad_scales(scales, size_n, size_k, padded_n, padded_k, GROUP_SIZE),
++        size_k=padded_k, size_n=padded_n, group_size=GROUP_SIZE,
++    )
++    empty = torch.empty(0, dtype=torch.int32, device=weight.device)
++    workspace = marlin_make_workspace_new(weight.device)
++    for name, value in (("w8_qweight", repacked), ("w8_scales", scales), ("w8_empty", empty), ("w8_workspace", workspace)):
++        module.register_buffer(name, value, persistent=False)
++    before = weight.numel() * weight.element_size()
++    after = sum(t.numel() * t.element_size() for t in (repacked, scales))
++    module.quant_method = DrafterW8A16Method(size_n, size_k)
++    del module._parameters["weight"]
++    return {"original_bytes": before, "packed_bytes": after, "padded_n": padded_n, "padded_k": padded_k}
++
++
++def expected_shapes(config, tp_size: int) -> dict[str, tuple[int, int]]:
++    """Per-rank (N, K) of every converted family, from the drafter config alone."""
++    hidden = int(config.hidden_size)
++    heads = int(config.num_attention_heads)
++    kv_heads = int(config.num_key_value_heads)
++    head_dim = int(getattr(config, "head_dim", None) or hidden // heads)
++    if heads % tp_size or int(config.intermediate_size) % tp_size:
++        raise RuntimeError(f"drafter config does not divide by TP {tp_size}")
++    local_q = heads // tp_size * head_dim
++    local_kv = max(1, kv_heads // tp_size) * head_dim
++    local_inter = int(config.intermediate_size) // tp_size
++    draft = config.dflash_config
++    groups = hidden // int(draft["conv_group_size"])
++    return {
++        "qkv_proj": (local_q + 2 * local_kv, hidden),
++        "o_proj": (hidden, local_q),
++        "gate_up_proj": (2 * local_inter, hidden),
++        "down_proj": (hidden, local_inter),
++        "kernel_projection": (2 * int(draft["conv_kernel_size"]) * groups, hidden),
++    }
++
++
++def _layer_modules(layer: nn.Module) -> list[tuple[str, nn.Module]]:
++    try:
++        return [
++            ("qkv_proj", layer.self_attn.qkv_proj),
++            ("o_proj", layer.self_attn.o_proj),
++            ("gate_up_proj", layer.mlp.gate_up_proj),
++            ("down_proj", layer.mlp.down_proj),
++            ("kernel_projection", layer.attention_conv.kernel_projection),
++            ("kernel_projection", layer.mlp_conv.kernel_projection),
++        ]
++    except AttributeError as error:
++        raise RuntimeError(f"drafter layer lacks an expected module: {error}") from None
++
++
++@torch.no_grad()
++def finalize_drafter_w8a16(model: nn.Module, tp_size: int, environ: dict | None = None) -> None:
++    """Convert the drafter's query-path linears after the vendor loader, if enabled."""
++    if not enabled(environ) or getattr(model, "_w8a16_ready", False):
++        return
++    # The fused context K/V copy is built from the BF16 qkv_proj weights by the vendor loader.
++    # Refuse unless it exists, so nothing can rebuild it from a converted weight later.
++    if not hasattr(model, "_num_attn_layers") or getattr(model, "_fused_kv_weight", None) is None:
++        raise RuntimeError("drafter W8A16 requires the vendor's fused context K/V buffers to be built first")
++    layers = list(getattr(model, "layers", []))
++    if len(layers) != EXPECTED_LAYERS:
++        raise RuntimeError(f"drafter W8A16 expected {EXPECTED_LAYERS} layers, got {len(layers)}")
++    shapes = expected_shapes(model.config, tp_size)
++    work = []
++    for index, layer in enumerate(layers):
++        for name, module in _layer_modules(layer):
++            w = getattr(module, "weight", None)
++            if (w is None or tuple(w.shape) != shapes[name] or w.dtype != torch.bfloat16 or w.device.type != "cuda"
++                    or not isinstance(getattr(module, "quant_method", None), UnquantizedLinearMethod)
++                    or getattr(module, "bias", None) is not None):
++                raise RuntimeError(f"drafter {name} at layer {index} is not the expected BF16 {shapes[name]} linear")
++            work.append((name, index, module, shapes[name]))
++    receipts = [{"family": n, "layer": i, **pack_projection(m, *s)} for n, i, m, s in work]
++    model._w8a16_ready = True
++    torch.cuda.empty_cache()
++    logger.info("DRAFTER_W8A16_READY %s", json.dumps({
++        "modules": len(receipts),
++        "families": sorted({r["family"] for r in receipts}),
++        "original_bytes": sum(r["original_bytes"] for r in receipts),
++        "packed_bytes": sum(r["packed_bytes"] for r in receipts),
++    }, sort_keys=True))
+diff -ruN a/vllm/model_executor/models/qwen3_dflash2.py b/vllm/model_executor/models/qwen3_dflash2.py
+--- a/vllm/model_executor/models/qwen3_dflash2.py	2026-09-23 20:49:15
++++ b/vllm/model_executor/models/qwen3_dflash2.py	2026-09-23 20:49:15
+@@ -286,5 +286,16 @@
+             self.lm_head, hidden_states, self.model.candidate_selector.top_k
+         )
+ 
++    def load_weights(self, weights):
++        # Optional 8-bit drafter weights (patch 10): convert after the stock loader,
++        # which has already built the BF16 fused context K/V copy. Off unless
++        # VLLM_DRAFTER_W8A16=1.
++        loaded = super().load_weights(weights)
++        from vllm.distributed import get_tensor_model_parallel_world_size
++        from vllm.model_executor.models.drafter_w8a16 import finalize_drafter_w8a16
++
++        finalize_drafter_w8a16(self.model, get_tensor_model_parallel_world_size())
++        return loaded
++
+ 
+ EntryClass = DFlash2Qwen3ForCausalLM

@@ -1,0 +1,11 @@
+--- a/flashinfer/data/include/flashinfer/attention/mla.cuh
++++ b/flashinfer/data/include/flashinfer/attention/mla.cuh
+@@ -1263,7 +1263,7 @@
+ 
+   DISPATCH_SMEM_CONFIG(smem_limit_per_sm, NUM_STAGES, CTA_TILE_KV, QK_SHARD, {
+     constexpr uint32_t EFF_NUM_STAGES = NUM_STAGES;
+-    constexpr uint32_t EFF_CTA_TILE_KV = std::is_same_v<DTypeKV, __nv_fp8_e4m3> ? 32 : CTA_TILE_KV;
++    constexpr uint32_t EFF_CTA_TILE_KV = std::is_same_v<DTypeKV, __nv_fp8_e4m3> ? (CTA_TILE_KV < 32u ? CTA_TILE_KV : 32u) : CTA_TILE_KV;
+     constexpr bool EFF_QK_SHARD = std::is_same_v<DTypeKV, __nv_fp8_e4m3> ? false : QK_SHARD;
+     using KTraits =
+         KernelTraits<CAUSAL, EFF_NUM_STAGES, EFF_QK_SHARD, HEAD_DIM_CKV, HEAD_DIM_KPE,

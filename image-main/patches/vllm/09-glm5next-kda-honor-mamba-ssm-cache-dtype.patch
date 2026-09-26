@@ -1,0 +1,30 @@
+diff --git a/vllm/models/glm5next/common/kda.py b/vllm/models/glm5next/common/kda.py
+index e42753c..2753222 100644
+--- a/vllm/models/glm5next/common/kda.py
++++ b/vllm/models/glm5next/common/kda.py
+@@ -161,7 +161,9 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
+         if self.model_config is None or self.cache_config is None:
+             raise ValueError("model_config and cache_config must be set")
+         return MambaStateDtypeCalculator.kda_state_dtype(
+-            self.model_config.dtype, self.cache_config.mamba_cache_dtype
++            self.model_config.dtype,
++            self.cache_config.mamba_cache_dtype,
++            self.cache_config.mamba_ssm_cache_dtype,
+         )
+ 
+     def get_state_shape(
+diff --git a/vllm/models/glm5next/common/model.py b/vllm/models/glm5next/common/model.py
+index 1c05603..bb3f086 100644
+--- a/vllm/models/glm5next/common/model.py
++++ b/vllm/models/glm5next/common/model.py
+@@ -1015,7 +1015,9 @@ class Glm5NextForCausalLM(
+         vllm_config: "VllmConfig",
+     ) -> tuple[torch.dtype, torch.dtype]:
+         return MambaStateDtypeCalculator.kda_state_dtype(
+-            vllm_config.model_config.dtype, vllm_config.cache_config.mamba_cache_dtype
++            vllm_config.model_config.dtype,
++            vllm_config.cache_config.mamba_cache_dtype,
++            vllm_config.cache_config.mamba_ssm_cache_dtype,
+         )
+ 
+     @classmethod

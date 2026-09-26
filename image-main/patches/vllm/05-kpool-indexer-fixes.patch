@@ -1,0 +1,69 @@
+diff --git a/vllm/models/glm5next/nvidia/sparse_indexer.py b/vllm/models/glm5next/nvidia/sparse_indexer.py
+index c80e442..f04f8af 100644
+--- a/vllm/models/glm5next/nvidia/sparse_indexer.py
++++ b/vllm/models/glm5next/nvidia/sparse_indexer.py
+@@ -329,8 +329,11 @@ def sparse_attn_indexer_kpool(
+             # expand each pool back to its kpool constituent tokens.
+             select_k = topk_tokens // index_kpool if index_kpool > 1 else topk_tokens
+             if index_kpool > 1:
+-                pool_topk = torch.empty(
+-                    (num_rows, select_k), dtype=torch.int32, device=logits.device
++                pool_topk = torch.full(
++                    (num_rows, select_k),
++                    -1,
++                    dtype=torch.int32,
++                    device=logits.device,
+                 )
+                 topk_dst = pool_topk
+             else:
+@@ -564,8 +567,8 @@ def sparse_attn_indexer_kpool(
+         # then expand each pool back to its kpool tokens.
+         select_k = topk_tokens // index_kpool if index_kpool > 1 else topk_tokens
+         if index_kpool > 1:
+-            pool_topk = torch.empty(
+-                (num_rows, select_k), dtype=torch.int32, device=logits.device
++            pool_topk = torch.full(
++                (num_rows, select_k), -1, dtype=torch.int32, device=logits.device
+             )
+             topk_dst = pool_topk
+         else:
+diff --git a/vllm/model_executor/layers/indexer_topk.py b/vllm/model_executor/layers/indexer_topk.py
+index c342244..354f770 100644
+--- a/vllm/model_executor/layers/indexer_topk.py
++++ b/vllm/model_executor/layers/indexer_topk.py
+@@ -163,6 +163,13 @@ class SparseIndexerTopk(torch.nn.Module):
+             current_platform.has_device_capability(90)
+             and not current_platform.is_device_capability_family(120)
+         )
++        # GB10-class parts (48 SMs, 99KB smem per block): persistent_topk
++        # oversubscribes past ~24K ctx and its FilteredTopK fallback needs
++        # 128KB smem, which hard-raises there. Route them to
++        # top_k_per_row_decode instead (same bound the kpool call site used).
++        self._persistent_capable = self._is_cuda and (
++            torch.cuda.get_device_properties(0).multi_processor_count >= 78
++        )
+ 
+     def resolve_backend(
+         self, logits: torch.Tensor, topk_tokens: int, num_rows: int
+@@ -183,6 +190,12 @@ class SparseIndexerTopk(torch.nn.Module):
+                 failures.append(
+                     f"topk_tokens must be in (512, 1024, 2048), got {topk_tokens}"
+                 )
++            elif not self._persistent_capable:
++                failures.append(
++                    "persistent_topk oversubscribes past ~24K ctx and its "
++                    "FilteredTopK fallback needs 128KB smem, which hard-raises "
++                    "on GB10-class parts (48 SMs, 99KB); use per_row/auto"
++                )
+         elif self._backend == "deep_select":
+             if not self._is_cuda:
+                 failures.append("requires a CUDA platform")
+@@ -224,7 +237,7 @@ class SparseIndexerTopk(torch.nn.Module):
+         """
+         if not self._cooperative_constraints(logits, topk_tokens, num_rows):
+             return "cooperative"
+-        if self._is_cuda and topk_tokens in (512, 1024, 2048):
++        if topk_tokens in (512, 1024, 2048) and self._persistent_capable:
+             return "persistent"
+         return "per_row"
+ 

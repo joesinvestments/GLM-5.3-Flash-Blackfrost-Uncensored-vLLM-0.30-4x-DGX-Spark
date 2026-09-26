@@ -4,3 +4,5 @@ tools/lab/.lab_run.history
 tools/lab/.lab.lock/
 __pycache__/
 *.pyc
+image/nccl/libnccl.so.2
+image-main/nccl/libnccl.so.2
